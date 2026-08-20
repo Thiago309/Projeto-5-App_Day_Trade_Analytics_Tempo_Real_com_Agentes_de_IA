@@ -201,9 +201,10 @@ dsa_agente_financeiro = Agent(name="DSA Agente Financeiro",
 
 
 # Agente orquestrador: coordena os sub-agentes e consolida as respostas
-# Modelo: groq/compound → modelo agente nativo da Groq, otimizado para workflows multi-agente
+# Modelo: qwen/qwen3.6-27b → LLM generativo com suporte a tool calling padrão (OpenAI-style)
+# Nota: groq/compound NÃO é compatível com tool calling do PhiData (usa sistema próprio)
 multi_ai_agent = Agent(team=[dsa_agente_web_search, dsa_agente_financeiro],
-                       model=Groq(id="groq/compound"),
+                       model=Groq(id="qwen/qwen3.6-27b"),
                        instructions=["Sempre inclua as fontes", "Use tabelas para mostrar os dados"],
                        show_tool_calls=True, markdown=True)
 
