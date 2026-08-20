@@ -4,8 +4,14 @@
 
 # Imports
 import re
+import time
+import requests
+import pandas as pd
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import streamlit as st
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 import plotly.graph_objects as go
 import plotly.express as px
 from phi.agent import Agent
@@ -31,8 +37,8 @@ FOREX_TICKERS = {
     "USD/BRL": "USDBRL=X",
     "EUR/GBP": "EURGBP=X",
     "EUR/JPY": "EURJPY=X",
-    "XAU/USD": "XAUUSD=X",   # Ouro
-    "XAG/USD": "XAGUSD=X",   # Prata
+    "XAU/USD": "GC=F",    # Ouro - Gold Futures (ticker intraday válido)
+    "XAG/USD": "SI=F",    # Prata - Silver Futures (ticker intraday válido)
 }
 
 # Converte o par Forex no formato legível (ex: EUR/USD) para o ticker do yFinance (ex: EURUSD=X)
@@ -50,12 +56,50 @@ def dsa_converte_ticker_forex(par):
 @st.cache_data(ttl=60)
 def dsa_extrai_dados(ticker, period="1d"):
 
-    # Cria um objeto Ticker do Yahoo Finance para o par Forex especificado
-    stock = yf.Ticker(ticker)
-    
-    # Obtém o histórico de cotações do par com intervalo de 1 minuto (dados intraday)
-    hist = stock.history(period=period, interval="1m")
-    
+    # Cria uma sessão HTTP com User-Agent de browser para evitar bloqueio do Yahoo Finance
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    })
+    # Configura retry automático para erros 429/5xx
+    retry = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
+    hist = pd.DataFrame()
+
+    # --- Tentativa 1: yf.Ticker().history() ---
+    try:
+        stock = yf.Ticker(ticker, session=session)
+        hist = stock.history(period=period, interval="1m")
+    except (YFRateLimitError, Exception):
+        hist = pd.DataFrame()
+
+    # --- Tentativa 2 (fallback): yf.download() usa endpoints diferentes ---
+    if hist.empty:
+        try:
+            time.sleep(2)  # Pausa antes do fallback para respeitar o rate limit
+            hist = yf.download(
+                ticker,
+                period=period,
+                interval="1m",
+                session=session,
+                progress=False,
+                auto_adjust=True
+            )
+        except (YFRateLimitError, Exception):
+            hist = pd.DataFrame()
+
+    # Se ambas as tentativas falharam, exibe aviso amigável
+    if hist.empty:
+        st.warning("⚠️ Yahoo Finance está bloqueando as requisições (Rate Limit). "
+                   "Aguarde 30 segundos e tente novamente.")
+        return hist
+
     # Reseta o índice do DataFrame para transformar a coluna de data em uma coluna normal
     hist.reset_index(inplace=True)
 
@@ -63,7 +107,7 @@ def dsa_extrai_dados(ticker, period="1d"):
     # Renomeia para "Date" para manter consistência com os gráficos
     if "Datetime" in hist.columns:
         hist.rename(columns={"Datetime": "Date"}, inplace=True)
-    
+
     # Retorna o DataFrame com os dados históricos do par Forex
     return hist
 
@@ -135,16 +179,18 @@ def dsa_plot_volume(hist, ticker):
 # Agentes de IA 
 
 # Agente de busca na web de forma automatica sobre as paridades de moedas FOREX. (REALIZA BUSCA)
+# Modelo: qwen/qwen3.6-27b → LLM generativo 27B, suporta tool calling e raciocínio
 dsa_agente_web_search = Agent(name="DSA Agente Web Search",
                               role="Fazer busca na web",
-                              model=Groq(id="deepseek-r1-distill-llama-70b"),
+                              model=Groq(id="qwen/qwen3.6-27b"),
                               tools=[DuckDuckGo()],
                               instructions=["Sempre inclua as fontes"],
                               show_tool_calls=True, markdown=True)
 
 # Agente de busca de dados financeiro das paridades de moedas FOREX. (REALIZA ANALISE)
+# Modelo: qwen/qwen3.6-27b → LLM generativo 27B, suporta tool calling e raciocínio
 dsa_agente_financeiro = Agent(name="DSA Agente Financeiro",
-                              model=Groq(id="deepseek-r1-distill-llama-70b"),
+                              model=Groq(id="qwen/qwen3.6-27b"),
                               tools=[YFinanceTools(stock_price=True,
                                                    analyst_recommendations=True,
                                                    stock_fundamentals=True,
@@ -154,15 +200,17 @@ dsa_agente_financeiro = Agent(name="DSA Agente Financeiro",
                               show_tool_calls=True, markdown=True)
 
 
+# Agente orquestrador: coordena os sub-agentes e consolida as respostas
+# Modelo: groq/compound → modelo agente nativo da Groq, otimizado para workflows multi-agente
 multi_ai_agent = Agent(team=[dsa_agente_web_search, dsa_agente_financeiro],
-                       model=Groq(id="llama-3.3-70b-versatile"),
+                       model=Groq(id="groq/compound"),
                        instructions=["Sempre inclua as fontes", "Use tabelas para mostrar os dados"],
                        show_tool_calls=True, markdown=True)
 
 ########## App Web ##########
 
 # Configuração da página do Streamlit
-st.set_page_config(page_title="Data Science Academy - Forex Analytics", page_icon=":currency_exchange:", layout="wide")
+st.set_page_config(page_title="Forex Analytics", page_icon=":currency_exchange:", layout="wide")
 
 # Barra Lateral com instruções
 st.sidebar.title("Instruções")
@@ -194,10 +242,10 @@ Este aplicativo realiza análises avançadas de pares Forex em tempo real utiliz
 
 # Botão de suporte na barra lateral
 if st.sidebar.button("Suporte"):
-    st.sidebar.write("No caso de dúvidas envie e-mail para: suporte@datascienceacademy.com.br")
+    st.sidebar.write("No caso de dúvidas envie e-mail para: teste_forex@hotmail.com")
 
 # Título principal
-st.title(":currency_exchange: Data Science Academy - Forex Analytics")
+st.title(":currency_exchange: Forex Analytics")
 
 # Interface principal
 st.header("Day Trade Forex Analytics em Tempo Real com Agentes de IA")
